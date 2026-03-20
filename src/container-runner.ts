@@ -23,6 +23,7 @@ import {
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
+  rwMountArgs,
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
@@ -255,7 +256,7 @@ function buildContainerArgs(
     if (mount.readonly) {
       args.push(...readonlyMountArgs(mount.hostPath, mount.containerPath));
     } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      args.push(...rwMountArgs(mount.hostPath, mount.containerPath));
     }
   }
 

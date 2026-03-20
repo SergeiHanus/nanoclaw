@@ -8,11 +8,46 @@ import os from 'os';
 
 import { logger } from './logger.js';
 
-/** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN = 'docker';
+/**
+ * The container runtime binary.
+ * Resolution order: CONTAINER_RUNTIME env var → podman (if found) → docker.
+ */
+export const CONTAINER_RUNTIME_BIN =
+  process.env.CONTAINER_RUNTIME || detectRuntime();
+
+function detectRuntime(): string {
+  for (const rt of ['podman', 'docker']) {
+    try {
+      execSync(`which ${rt}`, { stdio: 'pipe' });
+      return rt;
+    } catch {
+      // not found, try next
+    }
+  }
+  return 'docker'; // fallback — ensureContainerRuntimeRunning() will surface the error
+}
+
+export const IS_PODMAN = CONTAINER_RUNTIME_BIN === 'podman';
 
 /** Hostname containers use to reach the host machine. */
-export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+export const CONTAINER_HOST_GATEWAY = IS_PODMAN
+  ? 'host.containers.internal'
+  : 'host.docker.internal';
+
+/**
+ * Whether SELinux is currently in enforcing mode.
+ * When true, volume mounts require the :z relabeling option so the container
+ * process can access host-owned files under an SELinux-confined domain.
+ */
+export const SELINUX_ENFORCING = detectSELinux();
+
+function detectSELinux(): boolean {
+  try {
+    return fs.readFileSync('/sys/fs/selinux/enforce', 'utf-8').trim() === '1';
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Address the credential proxy binds to.
@@ -30,11 +65,14 @@ function detectProxyBindHost(): string {
   // Check /proc filesystem, not env vars — WSL_DISTRO_NAME isn't set under systemd.
   if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
 
-  // Bare-metal Linux: bind to the docker0 bridge IP instead of 0.0.0.0
+  // Bare-metal Linux: bind to the container bridge IP instead of 0.0.0.0.
+  // Docker uses docker0; rootful Podman uses podman0 or cni-podman0.
+  // Rootless Podman has no visible bridge — falls through to 0.0.0.0.
   const ifaces = os.networkInterfaces();
-  const docker0 = ifaces['docker0'];
-  if (docker0) {
-    const ipv4 = docker0.find((a) => a.family === 'IPv4');
+  const bridge =
+    ifaces['docker0'] ?? ifaces['podman0'] ?? ifaces['cni-podman0'];
+  if (bridge) {
+    const ipv4 = bridge.find((a) => a.family === 'IPv4');
     if (ipv4) return ipv4.address;
   }
   return '0.0.0.0';
@@ -42,9 +80,10 @@ function detectProxyBindHost(): string {
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
+  // On Linux the gateway hostname isn't injected automatically — add it explicitly.
+  // Podman 4+ does inject host.containers.internal, but we add it anyway for older versions.
   if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
+    return [`--add-host=${CONTAINER_HOST_GATEWAY}:host-gateway`];
   }
   return [];
 }
@@ -54,7 +93,18 @@ export function readonlyMountArgs(
   hostPath: string,
   containerPath: string,
 ): string[] {
-  return ['-v', `${hostPath}:${containerPath}:ro`];
+  // On SELinux-enforcing systems, :z relabels content as shared across containers.
+  const opts = SELINUX_ENFORCING ? 'ro,z' : 'ro';
+  return ['-v', `${hostPath}:${containerPath}:${opts}`];
+}
+
+/** Returns CLI args for a read-write bind mount. */
+export function rwMountArgs(hostPath: string, containerPath: string): string[] {
+  // On SELinux-enforcing systems, :z relabels content as shared across containers.
+  if (SELINUX_ENFORCING) {
+    return ['-v', `${hostPath}:${containerPath}:z`];
+  }
+  return ['-v', `${hostPath}:${containerPath}`];
 }
 
 /** Returns the shell command to stop a container by name. */
@@ -85,10 +135,10 @@ export function ensureContainerRuntimeRunning(): void {
       '║  Agents cannot run without a container runtime. To fix:        ║',
     );
     console.error(
-      '║  1. Ensure Docker is installed and running                     ║',
+      `║  1. Ensure ${CONTAINER_RUNTIME_BIN} is installed and running              ║`,
     );
     console.error(
-      '║  2. Run: docker info                                           ║',
+      `║  2. Run: ${CONTAINER_RUNTIME_BIN} info                                    ║`,
     );
     console.error(
       '║  3. Restart NanoClaw                                           ║',
