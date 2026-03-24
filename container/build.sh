@@ -10,10 +10,17 @@ IMAGE_NAME="nanoclaw-agent"
 TAG="${1:-latest}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
 
+# On SELinux-enforcing systems with rootless Podman, disable label confinement
+# so the build process can apply memory protections (execmem) when loading libc.
+BUILD_EXTRA_ARGS=""
+if [[ "${CONTAINER_RUNTIME}" == *podman* ]] && command -v getenforce &>/dev/null && [[ "$(getenforce 2>/dev/null)" == "Enforcing" ]]; then
+  BUILD_EXTRA_ARGS="--security-opt label=disable"
+fi
+
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG}"
 
-${CONTAINER_RUNTIME} build -t "${IMAGE_NAME}:${TAG}" .
+${CONTAINER_RUNTIME} build ${BUILD_EXTRA_ARGS} -t "${IMAGE_NAME}:${TAG}" .
 
 echo ""
 echo "Build complete!"

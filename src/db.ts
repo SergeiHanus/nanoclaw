@@ -204,12 +204,13 @@ export function storeChatMetadata(
  * Used during group metadata sync.
  */
 export function updateChatName(chatJid: string, name: string): void {
+  const isGroup = chatJid.endsWith('@g.us') ? 1 : 0;
   db.prepare(
     `
-    INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
-    ON CONFLICT(jid) DO UPDATE SET name = excluded.name
+    INSERT INTO chats (jid, name, last_message_time, is_group) VALUES (?, ?, ?, ?)
+    ON CONFLICT(jid) DO UPDATE SET name = excluded.name, is_group = excluded.is_group
   `,
-  ).run(chatJid, name, new Date().toISOString());
+  ).run(chatJid, name, new Date().toISOString(), isGroup);
 }
 
 export interface ChatInfo {

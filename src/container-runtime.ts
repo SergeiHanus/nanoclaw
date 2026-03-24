@@ -78,6 +78,31 @@ function detectProxyBindHost(): string {
   return '0.0.0.0';
 }
 
+/**
+ * CLI args to disable SELinux label confinement for a container.
+ * Required on SELinux-enforcing systems with rootless Podman so the container
+ * process can apply memory protections (execmem) when loading libc.
+ */
+export function selinuxRunArgs(): string[] {
+  if (SELINUX_ENFORCING && IS_PODMAN) {
+    return ['--security-opt', 'label=disable'];
+  }
+  return [];
+}
+
+/**
+ * For rootless Podman, map the host user's UID/GID into the container
+ * so bind-mounted files are accessible. Without this, uid 1000 inside the
+ * container maps to a subuid on the host instead of the actual host uid.
+ */
+export function rootlessPodmanArgs(): string[] {
+  const hostUid = process.getuid?.();
+  if (IS_PODMAN && hostUid != null && hostUid !== 0) {
+    return ['--userns=keep-id'];
+  }
+  return [];
+}
+
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
   // On Linux the gateway hostname isn't injected automatically — add it explicitly.
@@ -93,15 +118,17 @@ export function readonlyMountArgs(
   hostPath: string,
   containerPath: string,
 ): string[] {
-  // On SELinux-enforcing systems, :z relabels content as shared across containers.
-  const opts = SELINUX_ENFORCING ? 'ro,z' : 'ro';
+  // Device nodes (e.g. /dev/null) cannot be relabeled — skip :z for them.
+  const selinux = SELINUX_ENFORCING && !hostPath.startsWith('/dev/');
+  const opts = selinux ? 'ro,z' : 'ro';
   return ['-v', `${hostPath}:${containerPath}:${opts}`];
 }
 
 /** Returns CLI args for a read-write bind mount. */
 export function rwMountArgs(hostPath: string, containerPath: string): string[] {
-  // On SELinux-enforcing systems, :z relabels content as shared across containers.
-  if (SELINUX_ENFORCING) {
+  // Device nodes (e.g. /dev/null) cannot be relabeled — skip :z for them.
+  const selinux = SELINUX_ENFORCING && !hostPath.startsWith('/dev/');
+  if (selinux) {
     return ['-v', `${hostPath}:${containerPath}:z`];
   }
   return ['-v', `${hostPath}:${containerPath}`];
