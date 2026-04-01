@@ -213,6 +213,24 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
+  // Telegram digest tool: mount bundled script and session file (if present)
+  const telegramDigestBundle = path.join(projectRoot, 'container', 'tools', 'telegram-digest.js');
+  if (fs.existsSync(telegramDigestBundle)) {
+    mounts.push({
+      hostPath: telegramDigestBundle,
+      containerPath: '/tools/telegram-digest.js',
+      readonly: true,
+    });
+  }
+  const telegramSessionFile = '/data/keya/telegram_session.session';
+  if (fs.existsSync(telegramSessionFile)) {
+    mounts.push({
+      hostPath: telegramSessionFile,
+      containerPath: '/tools/telegram-session.session',
+      readonly: true,
+    });
+  }
+
   return mounts;
 }
 
@@ -221,6 +239,25 @@ function buildContainerArgs(
   containerName: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+
+  // Inject Telegram API credentials from /data/keya/.env (if present)
+  const telegramEnvFile = '/data/keya/.env';
+  if (fs.existsSync(telegramEnvFile)) {
+    const lines = fs.readFileSync(telegramEnvFile, 'utf-8').split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim().replace(/^export\s+/, '');
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      if (key !== 'TELEGRAM_API_ID' && key !== 'TELEGRAM_API_HASH') continue;
+      let value = trimmed.slice(eqIdx + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (value) args.push('-e', `${key}=${value}`);
+    }
+  }
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);

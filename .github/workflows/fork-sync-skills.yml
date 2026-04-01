@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   sync-and-merge:
-    if: github.repository != 'qwibitai/nanoclaw'
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@v1
