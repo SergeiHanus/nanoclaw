@@ -584,13 +584,33 @@ async function main(): Promise<void> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
-    writeOutput({
-      status: 'error',
-      result: null,
-      newSessionId: sessionId,
-      error: errorMessage
-    });
-    process.exit(1);
+
+    // Session expired — retry once with a fresh session so the user sees no error
+    if (sessionId && errorMessage.includes('No conversation found with session ID')) {
+      log('Session expired, retrying with fresh session...');
+      sessionId = undefined;
+      resumeAt = undefined;
+      try {
+        const retryResult = await runQuery(containerInput.prompt, sessionId, mcpServerPath, containerInput, sdkEnv);
+        if (retryResult.newSessionId) {
+          sessionId = retryResult.newSessionId;
+        }
+        writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+      } catch (retryErr) {
+        const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+        log(`Retry failed: ${retryMsg}`);
+        writeOutput({ status: 'error', result: null, error: retryMsg });
+        process.exit(1);
+      }
+    } else {
+      writeOutput({
+        status: 'error',
+        result: null,
+        newSessionId: sessionId,
+        error: errorMessage
+      });
+      process.exit(1);
+    }
   }
 }
 

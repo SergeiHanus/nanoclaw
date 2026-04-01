@@ -38,6 +38,7 @@ import {
   setRegisteredGroup,
   setRouterState,
   setSession,
+  deleteSession,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
@@ -335,17 +336,23 @@ async function runAgent(
       wrappedOnOutput,
     );
 
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
-    }
-
     if (output.status === 'error') {
+      // If the session expired, clear it so the next attempt starts fresh
+      if (output.error?.includes('No conversation found with session ID')) {
+        delete sessions[group.folder];
+        deleteSession(group.folder);
+        logger.warn({ group: group.name }, 'Stale session cleared');
+      }
       logger.error(
         { group: group.name, error: output.error },
         'Container agent error',
       );
       return 'error';
+    }
+
+    if (output.newSessionId) {
+      sessions[group.folder] = output.newSessionId;
+      setSession(group.folder, output.newSessionId);
     }
 
     return 'success';

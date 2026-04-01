@@ -435,14 +435,31 @@ export async function runContainerAgent(
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);
 
+    // Wall-clock watchdog: setTimeout uses the monotonic clock which pauses
+    // during system sleep, so a 30-min timer never fires after a 9-hour sleep.
+    // Date.now() uses the wall clock and does advance during sleep.
+    let lastActivityWall = Date.now();
+    const watchdog = setInterval(() => {
+      if (!timedOut && Date.now() - lastActivityWall > timeoutMs) {
+        clearInterval(watchdog);
+        logger.warn(
+          { group: group.name, containerName },
+          'Container wall-clock timeout (system was likely sleeping)',
+        );
+        killOnTimeout();
+      }
+    }, 60_000);
+
     // Reset the timeout whenever there's activity (streaming output)
     const resetTimeout = () => {
       clearTimeout(timeout);
       timeout = setTimeout(killOnTimeout, timeoutMs);
+      lastActivityWall = Date.now();
     };
 
     container.on('close', (code) => {
       clearTimeout(timeout);
+      clearInterval(watchdog);
       const duration = Date.now() - startTime;
 
       if (timedOut) {
