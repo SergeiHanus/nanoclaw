@@ -70,6 +70,7 @@ Status: [x] done, [~] partial, [ ] not started
 - [x] Session resolution (shared vs per-thread modes)
 - [x] Message writing to session DB with seq numbering
 - [x] Container waking on new message
+- [x] Typing indicator triggered on message route
 - [~] Trigger rule matching (router picks highest-priority agent, regex/mention matching TODO)
 
 ## Rich Messaging
@@ -104,7 +105,7 @@ Status: [x] done, [~] partial, [ ] not started
 - [x] Recurring tasks via cron expressions
 - [x] Host sweep picks up due messages and advances recurrence
 - [x] Scheduled outbound messages (no container wake needed)
-- [~] Pre-agent scripts (task kind with script field, documented but not verified)
+- [ ] Pre-agent scripts (formatter references scriptOutput but no execution logic)
 
 ## Permissions and Approval Flows
 
@@ -152,8 +153,8 @@ Status: [x] done, [~] partial, [ ] not started
 
 ## System Actions
 
-- [ ] register_group from inside agent (stub exists)
-- [ ] reset_session from inside agent (stub exists)
+- [ ] register_group from inside agent
+- [ ] reset_session from inside agent
 
 ## Integrations
 
