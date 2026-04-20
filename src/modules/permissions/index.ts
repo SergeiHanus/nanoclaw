@@ -17,8 +17,13 @@
  */
 import { recordDroppedMessage } from '../../db/dropped-messages.js';
 import {
+  createMessagingGroupAgent,
+  setMessagingGroupDeniedAt,
+} from '../../db/messaging-groups.js';
+import {
   routeInbound,
   setAccessGate,
+  setChannelRequestGate,
   setSenderResolver,
   setSenderScopeGate,
   type AccessGateResult,
@@ -28,7 +33,12 @@ import { registerResponseHandler, type ResponsePayload } from '../../response-re
 import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { canAccessAgentGroup } from './access.js';
+import { requestChannelApproval } from './channel-approval.js';
 import { addMember } from './db/agent-group-members.js';
+import {
+  deletePendingChannelApproval,
+  getPendingChannelApproval,
+} from './db/pending-channel-approvals.js';
 import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pending-sender-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
@@ -253,3 +263,137 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
 }
 
 registerResponseHandler(handleSenderApprovalResponse);
+
+// ── Unknown-channel registration flow ──
+
+setChannelRequestGate(async (mg, event) => {
+  await requestChannelApproval({ messagingGroupId: mg.id, event });
+});
+
+/**
+ * Response handler for the unknown-channel registration card.
+ *
+ * Claim rule: questionId matches a pending_channel_approvals row (keyed
+ * by messaging_group_id). If no such row, return false so downstream
+ * handlers get a shot.
+ *
+ * Approve: create the wiring with MVP defaults (mention-sticky for
+ * groups / pattern='.' for DMs; sender_scope='known';
+ * ignored_message_policy='accumulate'), add the triggering sender as a
+ * member so sender_scope doesn't immediately bounce them into a
+ * sender-approval card, then replay the original event.
+ *
+ * Deny: set `messaging_groups.denied_at = now()` so future mentions on
+ * this channel drop silently until an admin explicitly wires it.
+ */
+async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<boolean> {
+  const row = getPendingChannelApproval(payload.questionId);
+  if (!row) return false;
+
+  // Click-auth: same pattern as sender-approval (see commit 68058cb).
+  // Raw platform userId → namespace with channelType → must match the
+  // designated approver OR have admin privilege over the target agent.
+  const clickerId = payload.userId ? `${payload.channelType}:${payload.userId}` : null;
+  const isAuthorized =
+    clickerId !== null && (clickerId === row.approver_user_id || hasAdminPrivilege(clickerId, row.agent_group_id));
+  if (!isAuthorized) {
+    log.warn('Channel registration click rejected — unauthorized clicker', {
+      messagingGroupId: row.messaging_group_id,
+      clickerId,
+      expectedApprover: row.approver_user_id,
+    });
+    return true; // claim but take no action
+  }
+  const approverId = clickerId;
+  const approved = payload.value === 'approve';
+
+  if (!approved) {
+    setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
+    deletePendingChannelApproval(row.messaging_group_id);
+    log.info('Channel registration denied', {
+      messagingGroupId: row.messaging_group_id,
+      agentGroupId: row.agent_group_id,
+      approverId,
+    });
+    return true;
+  }
+
+  // Rehydrate the original event to know (a) whether it was a DM or group
+  // (chooses engage_mode default), and (b) who the triggering sender was
+  // (auto-member-add so sender_scope='known' doesn't bounce the replay).
+  let event: InboundEvent;
+  try {
+    event = JSON.parse(row.original_message) as InboundEvent;
+  } catch (err) {
+    log.error('Channel registration: failed to parse stored event', {
+      messagingGroupId: row.messaging_group_id,
+      err,
+    });
+    deletePendingChannelApproval(row.messaging_group_id);
+    return true;
+  }
+
+  // Decide engage_mode from the original event. DMs (`isMention=true` &
+  // not in a group) get `pattern='.'` (always respond). Group mentions
+  // get `mention-sticky` (respond now + follow the thread).
+  //
+  // We can't read `mg.is_group` reliably here because we only auto-create
+  // the mg with `is_group=0` on first sight — the adapter hasn't told us
+  // yet whether it's actually a group. Fall back to the InboundEvent's
+  // `threadId`: a non-null threadId implies a threaded platform (Slack
+  // channel thread, Discord thread), which we treat as a group.
+  const isGroup = event.threadId !== null;
+  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention-sticky' : 'pattern';
+  const engagePattern = isGroup ? null : '.';
+
+  const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  createMessagingGroupAgent({
+    id: mgaId,
+    messaging_group_id: row.messaging_group_id,
+    agent_group_id: row.agent_group_id,
+    engage_mode: engageMode,
+    engage_pattern: engagePattern,
+    sender_scope: 'known',
+    ignored_message_policy: 'accumulate',
+    session_mode: 'shared',
+    priority: 0,
+    created_at: new Date().toISOString(),
+  });
+  log.info('Channel registration approved — wiring created', {
+    messagingGroupId: row.messaging_group_id,
+    agentGroupId: row.agent_group_id,
+    mgaId,
+    engageMode,
+    approverId,
+  });
+
+  // Auto-admit the triggering sender. Without this, the replay below
+  // would bounce through sender-approval (sender_scope='known' +
+  // sender-is-not-a-member).
+  const senderUserId = extractAndUpsertUser(event);
+  if (senderUserId) {
+    addMember({
+      user_id: senderUserId,
+      agent_group_id: row.agent_group_id,
+      added_by: approverId,
+      added_at: new Date().toISOString(),
+    });
+  }
+
+  // Clear the pending row BEFORE replay so the gate check on the second
+  // attempt sees a wired channel (agentCount > 0) and takes the fan-out
+  // path normally.
+  deletePendingChannelApproval(row.messaging_group_id);
+
+  try {
+    await routeInbound(event);
+  } catch (err) {
+    log.error('Failed to replay message after channel approval', {
+      messagingGroupId: row.messaging_group_id,
+      err,
+    });
+  }
+  return true;
+}
+
+registerResponseHandler(handleChannelApprovalResponse);

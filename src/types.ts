@@ -17,6 +17,16 @@ export interface MessagingGroup {
   name: string | null;
   is_group: number; // 0 | 1
   unknown_sender_policy: UnknownSenderPolicy;
+  /**
+   * When set, the owner explicitly denied registering this channel — the
+   * router drops silently and does not re-escalate. Cleared by any explicit
+   * wiring mutation (admin command). See migration 012.
+   *
+   * Optional on the TS type so pre-migration-012 callers that build
+   * MessagingGroup objects in code (fixtures, etc.) don't need to update;
+   * the column itself defaults to NULL in SQLite.
+   */
+  denied_at?: string | null;
   created_at: string;
 }
 

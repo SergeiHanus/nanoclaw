@@ -127,6 +127,27 @@ export function setSenderScopeGate(fn: SenderScopeGateFn): void {
   senderScopeGate = fn;
 }
 
+/**
+ * Channel-registration hook. Runs when the router sees a mention/DM on a
+ * messaging group that has no wirings AND hasn't been denied. The hook is
+ * expected to escalate to an owner (card, etc.) and arrange for future
+ * replay via routeInbound after approval. Fire-and-forget from the
+ * router's perspective.
+ *
+ * Registered by the permissions module. Without the module the router
+ * silently records the drop with reason='no_agent_wired' and moves on.
+ */
+export type ChannelRequestGateFn = (mg: MessagingGroup, event: InboundEvent) => Promise<void>;
+
+let channelRequestGate: ChannelRequestGateFn | null = null;
+
+export function setChannelRequestGate(fn: ChannelRequestGateFn): void {
+  if (channelRequestGate) {
+    log.warn('Channel-request gate overwritten');
+  }
+  channelRequestGate = fn;
+}
+
 function safeParseContent(raw: string): { text?: string; sender?: string; senderId?: string } {
   try {
     return JSON.parse(raw);
@@ -156,12 +177,12 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   const found = getMessagingGroupWithAgentCount(event.channelType, event.platformId);
 
   let mg: MessagingGroup;
+  let agentCount: number;
   if (!found) {
     // No messaging_groups row. Auto-create only when the message warrants
     // attention (the bot was addressed — @mention or DM). Plain chatter in
     // channels we merely sit in stays silent — no row, no DB writes.
     if (!isMention) return;
-
     const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     mg = {
       id: mgId,
@@ -170,6 +191,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       name: null,
       is_group: 0,
       unknown_sender_policy: 'request_approval',
+      denied_at: null,
       created_at: new Date().toISOString(),
     };
     createMessagingGroup(mg);
@@ -178,30 +200,51 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       channelType: event.channelType,
       platformId: event.platformId,
     });
+    agentCount = 0;
   } else {
     mg = found.mg;
-    if (found.agentCount === 0) {
-      // Messaging group exists but has no wirings. Stay silent for plain
-      // messages; only log + record on explicit mention/DM so admins can
-      // see that someone tried to reach the bot on an unwired channel.
-      if (!isMention) return;
-      log.warn('MESSAGE DROPPED — no agent groups wired to this channel. Run setup register step to configure.', {
+    agentCount = found.agentCount;
+  }
+
+  // 1b. No wirings — either silent drop (plain chatter / denied channel) or
+  //     escalate to owner for channel-registration approval.
+  if (agentCount === 0) {
+    if (!isMention) return;
+    if (mg.denied_at) {
+      log.debug('Message dropped — channel was denied by owner', {
+        messagingGroupId: mg.id,
+        deniedAt: mg.denied_at,
+      });
+      return;
+    }
+
+    const parsed = safeParseContent(event.message.content);
+    recordDroppedMessage({
+      channel_type: event.channelType,
+      platform_id: event.platformId,
+      user_id: null,
+      sender_name: parsed.sender ?? null,
+      reason: 'no_agent_wired',
+      messaging_group_id: mg.id,
+      agent_group_id: null,
+    });
+
+    if (channelRequestGate) {
+      // Fire-and-forget escalation. The gate is expected to build a card,
+      // persist pending_channel_approvals, and replay the event via
+      // routeInbound after approval. Errors are logged internally — the
+      // user's message still stays dropped here either way.
+      void channelRequestGate(mg, event).catch((err) =>
+        log.error('Channel-request gate threw', { messagingGroupId: mg.id, err }),
+      );
+    } else {
+      log.warn('MESSAGE DROPPED — no agent groups wired and no channel-request gate registered', {
         messagingGroupId: mg.id,
         channelType: event.channelType,
         platformId: event.platformId,
       });
-      const parsed = safeParseContent(event.message.content);
-      recordDroppedMessage({
-        channel_type: event.channelType,
-        platform_id: event.platformId,
-        user_id: null,
-        sender_name: parsed.sender ?? null,
-        reason: 'no_agent_wired',
-        messaging_group_id: mg.id,
-        agent_group_id: null,
-      });
-      return;
     }
+    return;
   }
 
   // 2. Sender resolution (permissions module upserts the users row as a

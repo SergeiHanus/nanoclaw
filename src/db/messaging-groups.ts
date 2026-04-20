@@ -100,6 +100,20 @@ export function deleteMessagingGroup(id: string): void {
   getDb().prepare('DELETE FROM messaging_groups WHERE id = ?').run(id);
 }
 
+/**
+ * Mark a messaging group as denied by the owner (channel-registration flow).
+ * Future mentions on this channel silently drop until an admin explicitly
+ * wires it via `createMessagingGroupAgent`, which implicitly clears the
+ * denied state by making `agentCount > 0` — the router's denied-channel
+ * check sits on the `agentCount === 0` branch.
+ *
+ * Passing null unsets the flag (used by tests or a future "unblock channel"
+ * admin command).
+ */
+export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): void {
+  getDb().prepare('UPDATE messaging_groups SET denied_at = ? WHERE id = ?').run(deniedAt, id);
+}
+
 // ── Messaging Group Agents ──
 
 /**
