@@ -49,11 +49,57 @@ case "$(uname -s)" in
     ;;
 esac
 
+echo "STEP: ensure-pipx"
+if ! command -v pipx >/dev/null 2>&1; then
+  case "$(uname -s)" in
+    Darwin)
+      brew install pipx
+      ;;
+    Linux)
+      if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get install -y pipx
+      elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y pipx
+      elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --noconfirm python-pipx
+      else
+        echo "WARNING: cannot install pipx — unknown package manager. Install pipx manually then run: pipx install podman-compose"
+      fi
+      ;;
+  esac
+fi
+
+echo "STEP: pipx-install-podman-compose"
+if command -v pipx >/dev/null 2>&1; then
+  pipx install podman-compose
+else
+  echo "WARNING: pipx not found — skipping podman-compose install. Install pipx and run: pipx install podman-compose"
+fi
+
 if ! command -v podman >/dev/null 2>&1; then
   echo "STATUS: failed"
   echo "ERROR: podman not found on PATH after install"
   echo "=== END ==="
   exit 1
+fi
+
+echo "STEP: configure-registries"
+REGISTRIES_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/containers/registries.conf"
+mkdir -p "$(dirname "$REGISTRIES_CONF")"
+if [ ! -f "$REGISTRIES_CONF" ]; then
+  printf 'unqualified-search-registries = ["docker.io"]\n' > "$REGISTRIES_CONF"
+  echo "REGISTRIES: created"
+elif ! grep -q 'unqualified-search-registries' "$REGISTRIES_CONF"; then
+  # Prepend the line so it takes effect before any other content.
+  { printf 'unqualified-search-registries = ["docker.io"]\n\n'; cat "$REGISTRIES_CONF"; } > "$REGISTRIES_CONF.tmp"
+  mv "$REGISTRIES_CONF.tmp" "$REGISTRIES_CONF"
+  echo "REGISTRIES: prepended"
+elif ! grep -q 'docker\.io' "$REGISTRIES_CONF"; then
+  # Line exists but docker.io is missing — insert it into the array with sed.
+  sed -i 's/\(unqualified-search-registries\s*=\s*\[\)/\1"docker.io", /' "$REGISTRIES_CONF"
+  echo "REGISTRIES: updated"
+else
+  echo "REGISTRIES: already-configured"
 fi
 
 echo "STATUS: installed"

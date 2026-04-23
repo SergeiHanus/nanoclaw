@@ -58,18 +58,72 @@ function podmanSocketPath(): string {
 // Temp dir holding the docker→podman shim; cleaned up after install.
 let shimDir: string | null = null;
 
+/**
+ * On Linux, start podman.socket via systemd so the socket file exists before
+ * the OneCLI installer runs. The installer sets DOCKER_HOST to the socket path
+ * and any Docker API calls will fail immediately if the file isn't there.
+ */
+function ensurePodmanSocket(): void {
+  if (process.platform !== 'linux') return;
+  try {
+    execSync('systemctl --user enable --now podman.socket', {
+      stdio: 'ignore',
+      timeout: 10_000,
+    });
+    // Wait up to 5 s for the socket file to appear.
+    const sockPath = podmanSocketPath();
+    const deadline = Date.now() + 5_000;
+    while (!fs.existsSync(sockPath) && Date.now() < deadline) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    }
+    if (fs.existsSync(sockPath)) {
+      log.info('Podman socket ready', { sockPath });
+    } else {
+      log.warn('Podman socket did not appear after 5s — proceeding anyway', { sockPath });
+    }
+  } catch {
+    log.warn('Could not start podman.socket — proceeding without socket activation');
+  }
+}
+
+
+// Shared helper embedded in both shims: find the compose file from -f/--file
+// args and flatten nested variable substitutions that podman-compose 1.x
+// can't parse (it stops at the first } so ${A:-${B:-v}} → "value}" with a
+// stray closing brace). We use ONECLI_BIND_HOST from the environment (already
+// set by installerEnv) as the resolved value.
+const FLATTEN_COMPOSE_VARS = [
+  '_compose_file=""',
+  '_next_is_file=0',
+  'for _arg in "$@"; do',
+  '  if [ "$_next_is_file" = "1" ]; then _compose_file="$_arg"; _next_is_file=0',
+  '  elif [ "$_arg" = "-f" ] || [ "$_arg" = "--file" ]; then _next_is_file=1',
+  '  fi',
+  'done',
+  'if [ -n "$_compose_file" ] && [ -f "$_compose_file" ]; then',
+  '  _bind="${ONECLI_BIND_HOST:-127.0.0.1}"',
+  // sed -E on Linux; use | as delimiter so the IP (dots ok, no slashes) is safe
+  "  sed -i -E \\",
+  "    -e 's|\\$\\{ONECLI_API_BIND_HOST:-\\$\\{ONECLI_BIND_HOST:-[^}]*\\}\\}|'\"$_bind\"'|g' \\",
+  "    -e 's|\\$\\{ONECLI_GATEWAY_BIND_HOST:-\\$\\{ONECLI_BIND_HOST:-[^}]*\\}\\}|'\"$_bind\"'|g' \\",
+  '    "$_compose_file"',
+  'fi',
+].join('\n');
+
 function createDockerShim(): string {
   shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-docker-shim-'));
-  const shimPath = path.join(shimDir, 'docker');
-  // For compose subcommands call podman-compose directly (not via `podman compose`)
-  // so we can inject --podman-run-args for SELinux and strip --wait (unsupported).
-  // pollHealth() already waits for the gateway, so --wait is unnecessary.
+
+  // `docker` shim — intercepts `docker compose …` and falls through to podman.
+  // Patches nested ${VAR:-${OTHER:-default}} in the compose file before
+  // podman-compose sees it, then strips --wait (unsupported) and delegates.
+  const dockerShimPath = path.join(shimDir, 'docker');
   fs.writeFileSync(
-    shimPath,
+    dockerShimPath,
     [
       '#!/usr/bin/env bash',
       'if [ "$1" = "compose" ]; then',
       '  shift',
+      FLATTEN_COMPOSE_VARS.split('\n').map(l => `  ${l}`).join('\n'),
       '  args=()',
       '  for arg in "$@"; do',
       '    [ "$arg" != "--wait" ] && args+=("$arg")',
@@ -80,7 +134,26 @@ function createDockerShim(): string {
       '',
     ].join('\n'),
   );
-  fs.chmodSync(shimPath, 0o755);
+  fs.chmodSync(dockerShimPath, 0o755);
+
+  // `docker-compose` shim — catches installers that call the standalone binary
+  // directly. No shift needed: $1 is already the subcommand, not "compose".
+  const dockerComposeShimPath = path.join(shimDir, 'docker-compose');
+  fs.writeFileSync(
+    dockerComposeShimPath,
+    [
+      '#!/usr/bin/env bash',
+      FLATTEN_COMPOSE_VARS,
+      'args=()',
+      'for arg in "$@"; do',
+      '  [ "$arg" != "--wait" ] && args+=("$arg")',
+      'done',
+      'exec podman-compose --podman-run-args "--security-opt label=disable" "${args[@]}"',
+      '',
+    ].join('\n'),
+  );
+  fs.chmodSync(dockerComposeShimPath, 0o755);
+
   return shimDir;
 }
 
@@ -118,11 +191,15 @@ function installerEnv(): NodeJS.ProcessEnv {
   log.info('Podman: resolved OneCLI bind host', { bindHost });
   const parts = [shimDir];
   if (base.PATH) parts.push(base.PATH);
+  // Set the derived bind-host vars explicitly so podman-compose never needs
+  // to expand nested ${VAR:-${OTHER:-default}} syntax (unsupported in 1.5.0).
   return {
     ...base,
     PATH: parts.join(path.delimiter),
     DOCKER_HOST: `unix://${sock}`,
     ONECLI_BIND_HOST: bindHost,
+    ONECLI_API_BIND_HOST: bindHost,
+    ONECLI_GATEWAY_BIND_HOST: bindHost,
   };
 }
 
@@ -205,8 +282,11 @@ const ONECLI_CLI_REPO = 'onecli/onecli-cli';
 function installOnecli(): { stdout: string; ok: boolean } {
   let stdout = '';
 
-  // Podman: create docker→podman shim once for all runInstall calls below.
-  if (readContainerRuntime() === 'podman') createDockerShim();
+  // Podman: ensure the socket exists, then create the docker→podman shim.
+  if (readContainerRuntime() === 'podman') {
+    ensurePodmanSocket();
+    createDockerShim();
+  }
 
   try {
     // Gateway install (docker-compose based, no rate-limit concerns).

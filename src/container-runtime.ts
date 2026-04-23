@@ -66,9 +66,7 @@ export function ensureContainerRuntimeRunning(): void {
   } catch (err) {
     log.error('Failed to reach container runtime', { err });
     const runtimeName = IS_PODMAN ? 'Podman' : 'Docker';
-    const installHint = IS_PODMAN
-      ? 'Ensure Podman is installed (podman.io)'
-      : 'Ensure Docker is installed and running';
+    const installHint = IS_PODMAN ? 'Ensure Podman is installed (podman.io)' : 'Ensure Docker is installed and running';
     const checkHint = IS_PODMAN ? 'podman info' : 'docker info';
     console.error('\n╔════════════════════════════════════════════════════════════════╗');
     console.error(`║  FATAL: Container runtime (${runtimeName}) failed to start`.padEnd(67) + '║');
