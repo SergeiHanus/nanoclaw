@@ -90,13 +90,16 @@ probe_host_deps() {
 probe_docker() {
   DOCKER_STATUS="not_found"
   IMAGE_PRESENT="false"
-  command_exists docker || return 0
-  if ! with_timeout docker info >/dev/null 2>&1; then
+  local runtime
+  runtime=$(read_env_var CONTAINER_RUNTIME)
+  runtime="${runtime:-docker}"
+  command_exists "$runtime" || return 0
+  if ! with_timeout "$runtime" info >/dev/null 2>&1; then
     DOCKER_STATUS="installed_not_running"
     return 0
   fi
   DOCKER_STATUS="running"
-  if with_timeout docker image inspect "$AGENT_IMAGE" >/dev/null 2>&1; then
+  if with_timeout "$runtime" image inspect "$AGENT_IMAGE" >/dev/null 2>&1; then
     IMAGE_PRESENT="true"
   fi
 }

@@ -125,13 +125,16 @@ export async function run(_args: string[]): Promise<void> {
 
   log.info('Service status', { service, runningFromPath });
 
-  // 2. Check container runtime
+  // 2. Check container runtime (docker or podman, from CONTAINER_RUNTIME env/.env)
+  const { readEnvFile } = await import('../src/env.js');
+  const envRuntimeVars = readEnvFile(['CONTAINER_RUNTIME']);
+  const configuredRuntime = process.env.CONTAINER_RUNTIME ?? envRuntimeVars['CONTAINER_RUNTIME'] ?? 'docker';
   let containerRuntime = 'none';
   try {
-    execSync('docker info', { stdio: 'ignore' });
-    containerRuntime = 'docker';
+    execSync(`${configuredRuntime} info`, { stdio: 'ignore' });
+    containerRuntime = configuredRuntime;
   } catch {
-    // Docker not running
+    // runtime not running
   }
 
   // 3. Check credentials

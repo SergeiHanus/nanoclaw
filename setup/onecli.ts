@@ -27,6 +27,105 @@ function childEnv(): NodeJS.ProcessEnv {
   return { ...process.env, PATH: parts.join(path.delimiter) };
 }
 
+function readContainerRuntime(): string {
+  if (process.env.CONTAINER_RUNTIME) return process.env.CONTAINER_RUNTIME;
+  try {
+    const envFile = path.join(process.cwd(), '.env');
+    if (!fs.existsSync(envFile)) return 'docker';
+    const content = fs.readFileSync(envFile, 'utf-8');
+    const match = content.match(/^CONTAINER_RUNTIME=(.+)$/m);
+    if (match) return match[1].trim().replace(/^["']|["']$/g, '');
+  } catch {
+    // .env absent or unreadable
+  }
+  return 'docker';
+}
+
+function podmanSocketPath(): string {
+  // Try asking podman first (most reliable); fall back to the standard XDG path.
+  try {
+    const out = execSync('podman info --format "{{.Host.RemoteSocket.Path}}"', {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (out && out !== '<no value>') return out;
+  } catch {
+    // podman not answering — use the default path
+  }
+  return `/run/user/${os.userInfo().uid}/podman/podman.sock`;
+}
+
+// Temp dir holding the docker→podman shim; cleaned up after install.
+let shimDir: string | null = null;
+
+function createDockerShim(): string {
+  shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-docker-shim-'));
+  const shimPath = path.join(shimDir, 'docker');
+  // For compose subcommands call podman-compose directly (not via `podman compose`)
+  // so we can inject --podman-run-args for SELinux and strip --wait (unsupported).
+  // pollHealth() already waits for the gateway, so --wait is unnecessary.
+  fs.writeFileSync(
+    shimPath,
+    [
+      '#!/usr/bin/env bash',
+      'if [ "$1" = "compose" ]; then',
+      '  shift',
+      '  args=()',
+      '  for arg in "$@"; do',
+      '    [ "$arg" != "--wait" ] && args+=("$arg")',
+      '  done',
+      '  exec podman-compose --podman-run-args "--security-opt label=disable" "${args[@]}"',
+      'fi',
+      'exec podman "$@"',
+      '',
+    ].join('\n'),
+  );
+  fs.chmodSync(shimPath, 0o755);
+  return shimDir;
+}
+
+export function cleanupDockerShim(): void {
+  if (shimDir) {
+    try { fs.rmSync(shimDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    shimDir = null;
+  }
+}
+
+function detectBindHost(): string {
+  try {
+    // Linux: resolve the source IP used to reach an external address.
+    const out = execSync(
+      "ip route get 1.1.1.1 | awk '/src/{for(i=1;i<=NF;i++) if($i==\"src\") print $(i+1); exit}'",
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] },
+    ).trim();
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(out)) return out;
+  } catch { /* not Linux or ip not available */ }
+  try {
+    // macOS
+    const out = execSync('ipconfig getifaddr en0 || ipconfig getifaddr en1', {
+      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(out)) return out;
+  } catch { /* not macOS or no active interface */ }
+  return '0.0.0.0';
+}
+
+function installerEnv(): NodeJS.ProcessEnv {
+  const base = childEnv();
+  if (readContainerRuntime() !== 'podman' || !shimDir) return base;
+  const sock = podmanSocketPath();
+  const bindHost = detectBindHost();
+  log.info('Podman: resolved OneCLI bind host', { bindHost });
+  const parts = [shimDir];
+  if (base.PATH) parts.push(base.PATH);
+  return {
+    ...base,
+    PATH: parts.join(path.delimiter),
+    DOCKER_HOST: `unix://${sock}`,
+    ONECLI_BIND_HOST: bindHost,
+  };
+}
+
 function onecliVersion(): string | null {
   try {
     return execFileSync('onecli', ['version'], {
@@ -106,46 +205,62 @@ const ONECLI_CLI_REPO = 'onecli/onecli-cli';
 function installOnecli(): { stdout: string; ok: boolean } {
   let stdout = '';
 
-  // Gateway install (docker-compose based, no rate-limit concerns).
-  const gw = runInstall('curl -fsSL onecli.sh/install | sh');
-  stdout += gw.stdout;
-  if (!gw.ok) {
-    log.error('OneCLI gateway install failed', { stderr: gw.stderr });
-    return { stdout: stdout + (gw.stderr ?? ''), ok: false };
+  // Podman: create docker→podman shim once for all runInstall calls below.
+  if (readContainerRuntime() === 'podman') createDockerShim();
+
+  try {
+    // Gateway install (docker-compose based, no rate-limit concerns).
+    const gw = runInstall('curl -fsSL onecli.sh/install | sh');
+    stdout += gw.stdout;
+    if (!gw.ok) {
+      log.error('OneCLI gateway install failed', { stderr: gw.stderr });
+      return { stdout: stdout + (gw.stderr ?? ''), ok: false };
+    }
+
+    // CLI install. The upstream script calls the GitHub releases API
+    // (api.github.com) to resolve the latest tag — which 403s anonymous
+    // callers after 60 requests/hour per IP. Try upstream first; on failure
+    // resolve the version ourselves (via HTTP redirect, which isn't
+    // API-throttled) and download the release archive directly.
+    const upstream = runInstall('curl -fsSL onecli.sh/cli/install | sh');
+    stdout += upstream.stdout;
+    if (upstream.ok) return { stdout, ok: true };
+
+    log.warn('Upstream CLI installer failed — falling back to direct download', {
+      stderr: upstream.stderr,
+    });
+    stdout += (upstream.stderr ?? '') + '\n';
+
+    const fallback = installOnecliCliDirect();
+    stdout += fallback.stdout;
+    if (!fallback.ok) {
+      log.error('OneCLI CLI install failed (both upstream and direct fallback)');
+      return { stdout, ok: false };
+    }
+    return { stdout, ok: true };
+  } finally {
+    cleanupDockerShim();
   }
-
-  // CLI install. The upstream script calls the GitHub releases API
-  // (api.github.com) to resolve the latest tag — which 403s anonymous
-  // callers after 60 requests/hour per IP. Try upstream first; on failure
-  // resolve the version ourselves (via HTTP redirect, which isn't
-  // API-throttled) and download the release archive directly.
-  const upstream = runInstall('curl -fsSL onecli.sh/cli/install | sh');
-  stdout += upstream.stdout;
-  if (upstream.ok) return { stdout, ok: true };
-
-  log.warn('Upstream CLI installer failed — falling back to direct download', {
-    stderr: upstream.stderr,
-  });
-  stdout += (upstream.stderr ?? '') + '\n';
-
-  const fallback = installOnecliCliDirect();
-  stdout += fallback.stdout;
-  if (!fallback.ok) {
-    log.error('OneCLI CLI install failed (both upstream and direct fallback)');
-    return { stdout, ok: false };
-  }
-  return { stdout, ok: true };
 }
+
+// Gateway pull + start can be slow on first run; CLI install is fast.
+const INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
 
 function runInstall(cmd: string): { stdout: string; stderr?: string; ok: boolean } {
   try {
     const stdout = execSync(cmd, {
       encoding: 'utf-8',
+      env: installerEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: INSTALL_TIMEOUT_MS,
     });
     return { stdout, ok: true };
   } catch (err) {
-    const e = err as { stdout?: string; stderr?: string };
+    const e = err as { stdout?: string; stderr?: string; signal?: string };
+    if (e.signal === 'SIGTERM') {
+      log.error('OneCLI installer timed out', { cmd, timeoutMs: INSTALL_TIMEOUT_MS });
+      return { stdout: e.stdout ?? '', stderr: 'installer timed out after 5 minutes', ok: false };
+    }
     return { stdout: e.stdout ?? '', stderr: e.stderr, ok: false };
   }
 }

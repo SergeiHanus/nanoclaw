@@ -287,7 +287,8 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
   // that grants the current user rw directly. This is temporary — the socket
   // is recreated by dockerd on restart (and by then the user has relogged, so
   // normal group perms apply again).
-  let dockerGroupStale = !runningAsRoot && checkDockerGroupStale();
+  const usingDocker = (process.env.CONTAINER_RUNTIME ?? 'docker') === 'docker';
+  let dockerGroupStale = !runningAsRoot && usingDocker && checkDockerGroupStale();
   if (dockerGroupStale) {
     log.warn(
       'Docker group not active in systemd session — user was likely added to docker group mid-session',

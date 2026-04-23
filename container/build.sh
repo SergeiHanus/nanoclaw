@@ -19,12 +19,18 @@ cd "$SCRIPT_DIR"
 source "$PROJECT_ROOT/setup/lib/install-slug.sh"
 IMAGE_NAME="$(container_image_base)"
 TAG="${1:-latest}"
-CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-}"
 
-# Caller's env takes precedence; fall back to .env.
-if [ -z "${INSTALL_CJK_FONTS:-}" ] && [ -f "../.env" ]; then
-    INSTALL_CJK_FONTS="$(grep '^INSTALL_CJK_FONTS=' ../.env | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+# Caller's env takes precedence; fall back to .env for both CONTAINER_RUNTIME and INSTALL_CJK_FONTS.
+if [ -f "../.env" ]; then
+    if [ -z "${CONTAINER_RUNTIME:-}" ]; then
+        CONTAINER_RUNTIME="$(grep '^CONTAINER_RUNTIME=' ../.env | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+    fi
+    if [ -z "${INSTALL_CJK_FONTS:-}" ]; then
+        INSTALL_CJK_FONTS="$(grep '^INSTALL_CJK_FONTS=' ../.env | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+    fi
 fi
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
 
 BUILD_ARGS=()
 if [ "${INSTALL_CJK_FONTS:-false}" = "true" ]; then
@@ -32,10 +38,19 @@ if [ "${INSTALL_CJK_FONTS:-false}" = "true" ]; then
     BUILD_ARGS+=(--build-arg INSTALL_CJK_FONTS=true)
 fi
 
+# Podman on Linux with SELinux needs --security-opt label=disable on build,
+# otherwise /bin/sh inside the build fails with "cannot apply additional memory
+# protection after relocation: Permission denied".
+SECURITY_OPTS=()
+if [ "$CONTAINER_RUNTIME" = "podman" ] && [ "$(uname -s)" = "Linux" ]; then
+    SECURITY_OPTS+=(--security-opt label=disable)
+fi
+
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG}"
+echo "Runtime: ${CONTAINER_RUNTIME}"
 
-${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_NAME}:${TAG}" .
+${CONTAINER_RUNTIME} build "${SECURITY_OPTS[@]}" "${BUILD_ARGS[@]}" -t "${IMAGE_NAME}:${TAG}" .
 
 echo ""
 echo "Build complete!"
