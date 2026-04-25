@@ -113,9 +113,11 @@ export async function run(args: string[]): Promise<void> {
   }
 
   // Chat SDK adapters prefix platform IDs with the channel type
-  // (e.g. "telegram:123", "discord:guild:channel"). Normalize here so
-  // the stored ID always matches what the adapter sends at runtime.
-  if (!parsed.platformId.startsWith(`${parsed.channel}:`)) {
+  // (e.g. "telegram:123", "discord:guild:channel"). Native adapters that
+  // use bare JID formats (WhatsApp: <phone>@s.whatsapp.net, <id>@g.us)
+  // do NOT prefix — the '@' is the discriminator.
+  const isNativeJid = parsed.platformId.includes('@');
+  if (!isNativeJid && !parsed.platformId.startsWith(`${parsed.channel}:`)) {
     parsed.platformId = `${parsed.channel}:${parsed.platformId}`;
   }
 
@@ -181,6 +183,10 @@ export async function run(args: string[]): Promise<void> {
       response_scope: 'all',
       session_mode: parsed.sessionMode,
       priority: 0,
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
       created_at: new Date().toISOString(),
     });
     log.info('Wired agent to messaging group', {
