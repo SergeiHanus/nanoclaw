@@ -1,21 +1,44 @@
 /**
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
+ *
+ * Set CONTAINER_RUNTIME=podman in .env to use Podman instead of Docker.
  */
 import { execSync } from 'child_process';
 import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
+import { readEnvFile } from './env.js';
 
-/** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN = 'docker';
+const _envConfig = readEnvFile(['CONTAINER_RUNTIME']);
+
+/** The container runtime binary name. Defaults to docker; set CONTAINER_RUNTIME=podman to override. */
+export const CONTAINER_RUNTIME_BIN = process.env.CONTAINER_RUNTIME ?? _envConfig.CONTAINER_RUNTIME ?? 'docker';
+
+const IS_PODMAN = CONTAINER_RUNTIME_BIN === 'podman';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
-  // On Linux, host.docker.internal isn't built-in — add it explicitly
+  // On Linux, host.docker.internal isn't built-in — add it explicitly.
+  // Works for both Docker and Podman (podman 4.x+).
   if (os.platform() === 'linux') {
     return ['--add-host=host.docker.internal:host-gateway'];
+  }
+  return [];
+}
+
+/**
+ * Extra args injected on every `run` invocation.
+ * Podman on Linux needs two flags:
+ *  - --security-opt label=disable: SELinux relabeling breaks host-mounted paths
+ *  - --userns=keep-id: rootless Podman maps host uid 1000 → container uid 0, so
+ *    the container's `node` user (uid 1000) can't write to files owned by the host
+ *    user. keep-id preserves the host UID inside the container.
+ */
+export function runtimeExtraArgs(): string[] {
+  if (IS_PODMAN && os.platform() === 'linux') {
+    return ['--security-opt', 'label=disable', '--userns=keep-id'];
   }
   return [];
 }
@@ -43,12 +66,15 @@ export function ensureContainerRuntimeRunning(): void {
     log.debug('Container runtime already running');
   } catch (err) {
     log.error('Failed to reach container runtime', { err });
+    const runtimeName = IS_PODMAN ? 'Podman' : 'Docker';
+    const installHint = IS_PODMAN ? 'Ensure Podman is installed (podman.io)' : 'Ensure Docker is installed and running';
+    const checkHint = IS_PODMAN ? 'podman info' : 'docker info';
     console.error('\n╔════════════════════════════════════════════════════════════════╗');
-    console.error('║  FATAL: Container runtime failed to start                      ║');
+    console.error(`║  FATAL: Container runtime (${runtimeName}) failed to start`.padEnd(67) + '║');
     console.error('║                                                                ║');
     console.error('║  Agents cannot run without a container runtime. To fix:        ║');
-    console.error('║  1. Ensure Docker is installed and running                     ║');
-    console.error('║  2. Run: docker info                                           ║');
+    console.error(`║  1. ${installHint}`.padEnd(67) + '║');
+    console.error(`║  2. Run: ${checkHint}`.padEnd(67) + '║');
     console.error('║  3. Restart NanoClaw                                           ║');
     console.error('╚════════════════════════════════════════════════════════════════╝\n');
     throw new Error('Container runtime is required but failed to start', {

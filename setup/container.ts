@@ -3,6 +3,7 @@
  * Replaces 03-setup-container.sh
  */
 import { execSync, spawnSync } from 'child_process';
+import fs from 'fs';
 import path from 'path';
 import { setTimeout as sleep } from 'timers/promises';
 
@@ -11,10 +12,12 @@ import { getDefaultContainerImage } from '../src/install-slug.js';
 import { commandExists, getPlatform } from './platform.js';
 import { emitStatus } from './status.js';
 
-type DockerStatus = 'ok' | 'no-permission' | 'no-daemon' | 'other';
+const SUPPORTED_RUNTIMES = ['docker', 'podman'];
 
-function dockerStatus(): DockerStatus {
-  const res = spawnSync('docker', ['info'], { encoding: 'utf-8' });
+type RuntimeStatus = 'ok' | 'no-permission' | 'no-daemon' | 'other';
+
+function runtimeStatus(runtime: string): RuntimeStatus {
+  const res = spawnSync(runtime, ['info'], { encoding: 'utf-8' });
   if (res.status === 0) return 'ok';
   const err = `${res.stderr ?? ''}\n${res.stdout ?? ''}`;
   if (/permission denied/i.test(err)) return 'no-permission';
@@ -22,17 +25,15 @@ function dockerStatus(): DockerStatus {
   return 'other';
 }
 
-function dockerRunning(): boolean {
-  return dockerStatus() === 'ok';
+function runtimeRunning(runtime: string): boolean {
+  return runtimeStatus(runtime) === 'ok';
 }
 
 /**
- * Try to start Docker if it's installed but idle. Poll up to 60s for the
- * daemon to come up — but bail immediately if the socket is reachable and
- * only blocked by a group-permission error, since that won't resolve by
- * waiting (the caller handles the sg re-exec for that case).
+ * Try to start Docker if it's installed but idle. Not called for Podman, which
+ * is daemonless — `podman info` succeeds without any service to start.
  */
-async function tryStartDocker(): Promise<DockerStatus> {
+async function tryStartDocker(): Promise<RuntimeStatus> {
   const platform = getPlatform();
   log.info('Docker not running — attempting to start', { platform });
 
@@ -52,7 +53,7 @@ async function tryStartDocker(): Promise<DockerStatus> {
 
   for (let i = 0; i < 30; i++) {
     await sleep(2000);
-    const s = dockerStatus();
+    const s = runtimeStatus('docker');
     if (s === 'ok') {
       log.info('Docker is up');
       return 'ok';
@@ -66,10 +67,23 @@ async function tryStartDocker(): Promise<DockerStatus> {
   return 'no-daemon';
 }
 
+function readContainerRuntime(): string {
+  // Process env wins if already set (e.g. exported in shell before running setup).
+  if (process.env.CONTAINER_RUNTIME) return process.env.CONTAINER_RUNTIME;
+  // setup/index.ts doesn't load .env, so fall back to reading it directly.
+  try {
+    const envPath = path.join(process.cwd(), '.env');
+    const content = fs.readFileSync(envPath, 'utf-8');
+    const match = content.match(/^CONTAINER_RUNTIME=(.+)$/m);
+    if (match) return match[1].trim().replace(/^["']|["']$/g, '');
+  } catch {
+    // .env absent or unreadable — use default
+  }
+  return 'docker';
+}
+
 function parseArgs(args: string[]): { runtime: string } {
-  // `--runtime` is still accepted for backwards compatibility with the /setup
-  // skill, but `docker` is the only supported value.
-  let runtime = 'docker';
+  let runtime = readContainerRuntime();
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--runtime' && args[i + 1]) {
       runtime = args[i + 1];
@@ -85,7 +99,7 @@ export async function run(args: string[]): Promise<void> {
   const image = getDefaultContainerImage(projectRoot);
   const logFile = path.join(projectRoot, 'logs', 'setup.log');
 
-  if (runtime !== 'docker') {
+  if (!SUPPORTED_RUNTIMES.includes(runtime)) {
     emitStatus('SETUP_CONTAINER', {
       RUNTIME: runtime,
       IMAGE: image,
@@ -98,16 +112,20 @@ export async function run(args: string[]): Promise<void> {
     process.exit(4);
   }
 
-  if (!commandExists('docker')) {
-    log.info('Docker not found — running setup/install-docker.sh');
+  // Install runtime if missing
+  if (!commandExists(runtime)) {
+    const installerScript = runtime === 'podman'
+      ? 'setup/install-podman.sh'
+      : 'setup/install-docker.sh';
+    log.info(`${runtime} not found — running ${installerScript}`);
     try {
-      execSync('bash setup/install-docker.sh', { cwd: projectRoot, stdio: 'inherit' });
+      execSync(`bash ${installerScript}`, { cwd: projectRoot, stdio: 'inherit' });
     } catch (err) {
-      log.warn('install-docker.sh failed', { err });
+      log.warn(`${installerScript} failed`, { err });
     }
   }
 
-  if (!commandExists('docker')) {
+  if (!commandExists(runtime)) {
     emitStatus('SETUP_CONTAINER', {
       RUNTIME: runtime,
       IMAGE: image,
@@ -121,17 +139,21 @@ export async function run(args: string[]): Promise<void> {
   }
 
   {
-    let status = dockerStatus();
+    let status = runtimeStatus(runtime);
+
     if (status !== 'ok') {
-      status = await tryStartDocker();
+      if (runtime === 'podman') {
+        // Podman is daemonless — if `podman info` fails it's a real problem,
+        // not a "daemon not started" situation.
+        log.warn('Podman not accessible', { status });
+      } else {
+        status = await tryStartDocker();
+      }
     }
 
-    // Socket is unreachable due to group perms — current shell's supplementary
-    // groups are fixed at login, so `usermod -aG docker` (via install-docker.sh
-    // or a prior install) doesn't affect us until next login. Re-exec this
-    // step under `sg docker` so the child picks up docker as its primary
-    // group and can talk to /var/run/docker.sock without a logout.
-    if (status === 'no-permission' && getPlatform() === 'linux' && commandExists('sg')) {
+    // Socket is unreachable due to group perms (Docker only) — re-exec under
+    // `sg docker` so the child picks up docker as its primary group.
+    if (status === 'no-permission' && runtime === 'docker' && getPlatform() === 'linux' && commandExists('sg')) {
       log.info('Re-executing container step under `sg docker`');
       const res = spawnSync(
         'sg',
@@ -157,11 +179,10 @@ export async function run(args: string[]): Promise<void> {
     }
   }
 
-  const buildCmd = 'docker build';
-  const runCmd = 'docker';
+  const buildCmd = `${runtime} build`;
+  const runCmd = runtime;
 
   // Build-args from .env. Only INSTALL_CJK_FONTS is passed through today.
-  // Keeps /setup and ./container/build.sh in sync — both read the same source.
   const buildArgs: string[] = [];
   try {
     const fs = await import('fs');
@@ -172,19 +193,24 @@ export async function run(args: string[]): Promise<void> {
       if (val === 'true') buildArgs.push('--build-arg INSTALL_CJK_FONTS=true');
     }
   } catch {
-    // .env is optional; absence is normal on a fresh checkout
+    // .env is optional
   }
 
-  // Build — stdio inherit so the parent setup runner can tail docker's
-  // per-step output and render it in a rolling window. Previously we used
-  // execSync which buffered everything; users couldn't tell whether a
-  // 3–10 minute build was making progress or hung.
+  // Podman on Linux with SELinux needs --security-opt label=disable on build too,
+  // otherwise /bin/sh inside the build step hits "cannot apply additional memory
+  // protection after relocation: Permission denied".
+  const buildSecOpts = runtime === 'podman' && process.platform === 'linux'
+    ? ['--security-opt', 'label=disable']
+    : [];
+
+  // Build — stdio inherit so the parent setup runner can tail output.
   let buildOk = false;
   log.info('Building container', { runtime, buildArgs });
   const buildRes = spawnSync(
     buildCmd.split(' ')[0],
     [
       ...buildCmd.split(' ').slice(1),
+      ...buildSecOpts,
       ...buildArgs.flatMap((a) => a.split(' ')),
       '-t',
       image,
@@ -202,13 +228,17 @@ export async function run(args: string[]): Promise<void> {
     log.error('Container build failed', { exitCode: buildRes.status });
   }
 
-  // Test
+  // Test run
   let testOk = false;
   if (buildOk) {
     log.info('Testing container');
     try {
+      // Podman on Linux with SELinux needs --security-opt label=disable
+      const secOpts = runtime === 'podman' && process.platform === 'linux'
+        ? '--security-opt label=disable'
+        : '';
       const output = execSync(
-        `echo '{}' | ${runCmd} run -i --rm --entrypoint /bin/echo ${image} "Container OK"`,
+        `echo '{}' | ${runCmd} run -i --rm ${secOpts} --entrypoint /bin/echo ${image} "Container OK"`,
         { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
       );
       testOk = output.includes('Container OK');

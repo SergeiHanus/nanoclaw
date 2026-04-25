@@ -105,7 +105,15 @@ async function main(): Promise<void> {
     });
     if (!res.ok) {
       const err = res.terminal?.fields.ERROR;
+      const runtime = process.env.CONTAINER_RUNTIME ?? 'docker';
       if (err === 'runtime_not_available') {
+        if (runtime === 'podman') {
+          await fail(
+            'container',
+            "Podman isn't available.",
+            'Install Podman (https://podman.io) or run `bash setup/install-podman.sh`, then retry.',
+          );
+        }
         await fail(
           'container',
           "Docker isn't available.",
@@ -119,10 +127,13 @@ async function main(): Promise<void> {
           'Log out and back in (or run `newgrp docker` in a new shell), then retry.',
         );
       }
+      const pruneHint = runtime === 'podman'
+        ? '`podman system prune -f`'
+        : '`docker builder prune -f`';
       await fail(
         'container',
         "Couldn't build the sandbox.",
-        'If Docker has a stale cache, try: `docker builder prune -f`, then retry.',
+        `If the ${runtime} cache is stale, try: ${pruneHint}, then retry.`,
       );
     }
     maybeReexecUnderSg();
@@ -221,7 +232,7 @@ async function main(): Promise<void> {
         'See logs/nanoclaw.error.log for details.',
       );
     }
-    if (res.terminal?.fields.DOCKER_GROUP_STALE === 'true') {
+    if (res.terminal?.fields.DOCKER_GROUP_STALE === 'true' && (process.env.CONTAINER_RUNTIME ?? 'docker') === 'docker') {
       p.log.warn(
         "NanoClaw's permissions need a tweak before it can reach Docker.",
       );
@@ -925,6 +936,8 @@ function runInheritScript(cmd: string, args: string[]): Promise<number> {
  * so the rest of the run inherits the docker group without a re-login.
  */
 function maybeReexecUnderSg(): void {
+  // Podman is daemonless and rootless — no group permission on a socket.
+  if ((process.env.CONTAINER_RUNTIME ?? 'docker') !== 'docker') return;
   if (process.env.NANOCLAW_REEXEC_SG === '1') return;
   if (process.platform !== 'linux') return;
   const info = spawnSync('docker', ['info'], { encoding: 'utf-8' });

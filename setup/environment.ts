@@ -21,12 +21,15 @@ export async function run(_args: string[]): Promise<void> {
   const wsl = isWSL();
   const headless = isHeadless();
 
-  // Check Docker
+  // Check container runtime (docker or podman, from CONTAINER_RUNTIME env/.env)
+  const { readEnvFile } = await import('../src/env.js');
+  const envOverrides = readEnvFile(['CONTAINER_RUNTIME']);
+  const containerRuntime = process.env.CONTAINER_RUNTIME ?? envOverrides['CONTAINER_RUNTIME'] ?? 'docker';
   let docker: 'running' | 'installed_not_running' | 'not_found' = 'not_found';
-  if (commandExists('docker')) {
+  if (commandExists(containerRuntime)) {
     try {
       const { execSync } = await import('child_process');
-      execSync('docker info', { stdio: 'ignore' });
+      execSync(`${containerRuntime} info`, { stdio: 'ignore' });
       docker = 'running';
     } catch {
       docker = 'installed_not_running';
